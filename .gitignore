@@ -1,8 +1,9 @@
 # Credentials
 .env
 
-# Twitter archive files (contain personal data)
+# Twitter archive files and backups (contain personal data)
 *.js
+*.csv
 
 # Python
 __pycache__/

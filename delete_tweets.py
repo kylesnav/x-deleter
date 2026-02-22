@@ -2,11 +2,13 @@
 """Delete all tweets from your X/Twitter account."""
 
 import argparse
+import csv
 import json
 import logging
 import os
 import sys
 import time
+from datetime import datetime
 
 import requests
 from requests_oauthlib import OAuth1
@@ -133,11 +135,29 @@ def parse_archive(archive_path, logger):
         tweet = item.get("tweet", item)
         tweet_id = tweet.get("id_str") or tweet.get("id")
         text = tweet.get("full_text") or tweet.get("text", "")
+        created_at = tweet.get("created_at", "")
         if tweet_id:
-            tweets.append({"id": str(tweet_id), "text": text})
+            tweets.append({"id": str(tweet_id), "text": text, "created_at": created_at})
 
     logger.info(f"Parsed {len(tweets)} tweets from archive file")
     return tweets
+
+
+def save_tweets_csv(tweets, username, logger):
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    desktop = os.path.expanduser("~/Desktop")
+    filename = os.path.join(desktop, f"tweets_backup_{username}_{timestamp}.csv")
+    with open(filename, "w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        writer.writerow(["id", "created_at", "text"])
+        for tweet in tweets:
+            writer.writerow([
+                tweet.get("id", ""),
+                tweet.get("created_at", ""),
+                tweet.get("text", ""),
+            ])
+    logger.info(f"Saved {len(tweets)} tweets to {filename}")
+    return filename
 
 
 def delete_tweets(auth, tweets, dry_run, logger):
@@ -225,13 +245,17 @@ def main():
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    parser.add_argument("--dry-run", action="store_true", help="Preview without deleting.")
-    parser.add_argument("--verbose", action="store_true", help="Debug-level logging.")
 
     subparsers = parser.add_subparsers(dest="mode", required=True)
-    subparsers.add_parser("api", help="Fetch up to 3,200 recent tweets via API and delete them.")
+
+    api_parser = subparsers.add_parser("api", help="Fetch up to 3,200 recent tweets via API and delete them.")
+    api_parser.add_argument("--dry-run", action="store_true", help="Preview without deleting.")
+    api_parser.add_argument("--verbose", action="store_true", help="Debug-level logging.")
+
     archive_parser = subparsers.add_parser("archive", help="Delete tweets from a Twitter data export.")
     archive_parser.add_argument("file", help="Path to tweets.js from your Twitter data export.")
+    archive_parser.add_argument("--dry-run", action="store_true", help="Preview without deleting.")
+    archive_parser.add_argument("--verbose", action="store_true", help="Debug-level logging.")
 
     args = parser.parse_args()
     logger = setup_logging(args.verbose)
@@ -254,20 +278,23 @@ def main():
         logger.info("No tweets found. Nothing to do.")
         return
 
-    logger.info(f"Found {len(tweets)} tweets to {'preview' if args.dry_run else 'delete'}.")
+    logger.info(f"Found {len(tweets)} tweets.")
 
-    if not args.dry_run:
-        confirm = input(f"Delete {len(tweets)} tweets from @{me['username']}? This cannot be undone. [y/N] ")
-        if confirm.lower() != "y":
-            logger.info("Aborted.")
-            return
-
-    deleted, failed = delete_tweets(auth, tweets, args.dry_run, logger)
+    # Always save a backup CSV before doing anything
+    backup_file = save_tweets_csv(tweets, me["username"], logger)
 
     if args.dry_run:
-        logger.info(f"Dry run complete. {len(tweets)} tweets would be deleted.")
+        deleted, failed = delete_tweets(auth, tweets, True, logger)
+        logger.info(f"Dry run complete. {len(tweets)} tweets would be deleted. Backup saved to {backup_file}")
     else:
+        confirm = input(f"Delete {len(tweets)} tweets from @{me['username']}? This cannot be undone. [y/N] ")
+        if confirm.lower() != "y":
+            logger.info(f"Aborted. Backup still saved to {backup_file}")
+            return
+
+        deleted, failed = delete_tweets(auth, tweets, False, logger)
         logger.info(f"Done. Deleted: {deleted}, Failed: {failed}, Total: {len(tweets)}")
+        logger.info(f"Backup saved to {backup_file}")
 
 
 if __name__ == "__main__":
