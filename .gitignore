@@ -1,0 +1,19 @@
+# Credentials
+.env
+
+# Twitter archive files (contain personal data)
+*.js
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+*.swp
