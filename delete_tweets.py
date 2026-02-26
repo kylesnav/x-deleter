@@ -14,9 +14,10 @@ import requests
 from requests_oauthlib import OAuth1
 from dotenv import load_dotenv
 
-BASE_URL = "https://api.twitter.com/2"
+BASE_URL_V2 = "https://api.twitter.com/2"
+BASE_URL_V1 = "https://api.twitter.com/1.1"
 RATE_LIMIT_WINDOW = 15 * 60  # 15 minutes in seconds
-RATE_LIMIT_MAX = 50
+RATE_LIMIT_MAX = 14  # v1.1 destroy is 15 per 15 min, stay 1 under
 TIMELINE_PAGE_SIZE = 100
 
 
@@ -60,7 +61,7 @@ def create_auth(creds):
 
 def get_me(auth):
     try:
-        resp = requests.get(f"{BASE_URL}/users/me", auth=auth)
+        resp = requests.get(f"{BASE_URL_V2}/users/me", auth=auth)
     except requests.RequestException as e:
         print(f"Error: Could not connect to Twitter API: {e}", file=sys.stderr)
         sys.exit(1)
@@ -77,7 +78,7 @@ def get_me(auth):
 
 def fetch_timeline_tweet_ids(auth, user_id, logger):
     tweets = []
-    url = f"{BASE_URL}/users/{user_id}/tweets"
+    url = f"{BASE_URL_V2}/users/{user_id}/tweets"
     params = {
         "max_results": TIMELINE_PAGE_SIZE,
         "tweet.fields": "id,created_at,text",
@@ -169,67 +170,60 @@ def delete_tweets(auth, tweets, dry_run, logger):
 
     deleted = 0
     failed = 0
-    batch_start = time.monotonic()
-    batch_count = 0
+    skipped = 0
 
     try:
         for i, tweet in enumerate(tweets):
-            # Proactive rate limiting
-            if batch_count >= RATE_LIMIT_MAX:
-                elapsed = time.monotonic() - batch_start
-                remaining = RATE_LIMIT_WINDOW - elapsed
-                if remaining > 0:
-                    logger.info(f"Rate limit reached ({batch_count}/{RATE_LIMIT_MAX}). Sleeping {remaining:.0f}s...")
-                    time.sleep(remaining + 1)
-                batch_start = time.monotonic()
-                batch_count = 0
-
-            url = f"{BASE_URL}/tweets/{tweet['id']}"
+            url = f"{BASE_URL_V1}/statuses/destroy/{tweet['id']}.json"
 
             try:
-                resp = requests.delete(url, auth=auth)
+                resp = requests.post(url, auth=auth)
             except requests.RequestException as e:
                 logger.error(f"[{i+1}/{len(tweets)}] Network error: {e}")
                 failed += 1
                 continue
 
             if resp.status_code == 200:
-                if resp.json().get("data", {}).get("deleted"):
-                    deleted += 1
-                    batch_count += 1
-                    logger.info(f"[{i+1}/{len(tweets)}] Deleted tweet {tweet['id']}")
-                else:
-                    logger.warning(f"[{i+1}/{len(tweets)}] Tweet {tweet['id']} not deleted (may already be gone)")
+                deleted += 1
+                logger.info(f"[{i+1}/{len(tweets)}] Deleted tweet {tweet['id']}")
+            elif resp.status_code == 404:
+                skipped += 1
+                logger.debug(f"[{i+1}/{len(tweets)}] Tweet {tweet['id']} already gone (404)")
             elif resp.status_code == 429:
-                # Reactive rate limit handling
                 reset_time = int(resp.headers.get("x-rate-limit-reset", time.time() + RATE_LIMIT_WINDOW))
-                sleep_seconds = max(reset_time - int(time.time()), 1) + 1
-                logger.warning(f"Rate limited (429). Sleeping {sleep_seconds}s...")
+                sleep_seconds = max(reset_time - int(time.time()), 1) + 2
+                logger.warning(f"Rate limited (429). Sleeping {sleep_seconds}s until reset...")
                 time.sleep(sleep_seconds)
-                batch_start = time.monotonic()
-                batch_count = 0
                 # Retry this tweet
                 try:
-                    retry = requests.delete(url, auth=auth)
-                    if retry.status_code == 200 and retry.json().get("data", {}).get("deleted"):
+                    retry = requests.post(url, auth=auth)
+                    if retry.status_code == 200:
                         deleted += 1
-                        batch_count += 1
                         logger.info(f"[{i+1}/{len(tweets)}] Deleted tweet {tweet['id']} (retry)")
+                    elif retry.status_code == 404:
+                        skipped += 1
                     else:
                         logger.error(f"[{i+1}/{len(tweets)}] Retry failed for {tweet['id']}: {retry.status_code}")
                         failed += 1
                 except requests.RequestException as e:
                     logger.error(f"[{i+1}/{len(tweets)}] Retry network error: {e}")
                     failed += 1
-            elif resp.status_code == 404:
-                logger.warning(f"[{i+1}/{len(tweets)}] Tweet {tweet['id']} already gone (404)")
             else:
                 logger.error(f"[{i+1}/{len(tweets)}] Failed {tweet['id']}: HTTP {resp.status_code}")
                 failed += 1
 
+            # Check remaining rate limit from headers and sleep proactively
+            remaining = resp.headers.get("x-rate-limit-remaining")
+            reset_ts = resp.headers.get("x-rate-limit-reset")
+            if remaining is not None and int(remaining) <= 0 and reset_ts:
+                sleep_seconds = max(int(reset_ts) - int(time.time()), 1) + 2
+                logger.info(f"Rate limit exhausted. Sleeping {sleep_seconds}s until reset...")
+                time.sleep(sleep_seconds)
+
     except KeyboardInterrupt:
         logger.info("\nInterrupted. Partial results below.")
 
+    logger.info(f"Skipped (already deleted): {skipped}")
     return deleted, failed
 
 
@@ -250,11 +244,13 @@ def main():
 
     api_parser = subparsers.add_parser("api", help="Fetch up to 3,200 recent tweets via API and delete them.")
     api_parser.add_argument("--dry-run", action="store_true", help="Preview without deleting.")
+    api_parser.add_argument("--yes", "-y", action="store_true", help="Skip confirmation prompt.")
     api_parser.add_argument("--verbose", action="store_true", help="Debug-level logging.")
 
     archive_parser = subparsers.add_parser("archive", help="Delete tweets from a Twitter data export.")
     archive_parser.add_argument("file", help="Path to tweets.js from your Twitter data export.")
     archive_parser.add_argument("--dry-run", action="store_true", help="Preview without deleting.")
+    archive_parser.add_argument("--yes", "-y", action="store_true", help="Skip confirmation prompt.")
     archive_parser.add_argument("--verbose", action="store_true", help="Debug-level logging.")
 
     args = parser.parse_args()
@@ -287,10 +283,11 @@ def main():
         deleted, failed = delete_tweets(auth, tweets, True, logger)
         logger.info(f"Dry run complete. {len(tweets)} tweets would be deleted. Backup saved to {backup_file}")
     else:
-        confirm = input(f"Delete {len(tweets)} tweets from @{me['username']}? This cannot be undone. [y/N] ")
-        if confirm.lower() != "y":
-            logger.info(f"Aborted. Backup still saved to {backup_file}")
-            return
+        if not args.yes:
+            confirm = input(f"Delete {len(tweets)} tweets from @{me['username']}? This cannot be undone. [y/N] ")
+            if confirm.lower() != "y":
+                logger.info(f"Aborted. Backup still saved to {backup_file}")
+                return
 
         deleted, failed = delete_tweets(auth, tweets, False, logger)
         logger.info(f"Done. Deleted: {deleted}, Failed: {failed}, Total: {len(tweets)}")
